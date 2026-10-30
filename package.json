@@ -22,12 +22,17 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./backend": {
+      "import": "./dist/backend.js",
+      "types": "./dist/backend.d.ts"
     }
   },
   "files": [
     "dist/",
     "src/",
     "config/",
+    "docs/",
     "README.md"
   ],
   "bin": {
@@ -36,7 +41,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "npx tsx tests/index.ts",
+    "test": "tsx tests/index.ts && tsx tests/backend.ts && tsx tests/whatsapp.ts",
     "demo": "npx tsx tests/demo-server.ts",
     "client": "npx tsx tests/client-demo.ts",
     "prepublishOnly": "rm -rf dist && tsc"
@@ -55,7 +60,11 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.3",
-    "@sinclair/typebox": ">=0.32.0"
+    "@sinclair/typebox": ">=0.32.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc13"
+  },
+  "peerDependenciesMeta": {
+    "@whiskeysockets/baileys": { "optional": true }
   },
   "pi": {
     "extensions": [

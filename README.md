@@ -1,5 +1,7 @@
 # pi-gateway
 
+For an experimental trusted in-process, no-RPC backend host, see [backend host](docs/backend-host.md). It is separate from legacy mode and does not provide durable delivery.
+
 Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord, Slack, and more. Real-time streaming, per-chat sessions, background tasks, and role-based access control.
 
 > Fork of [0xKobold/pi-gateway](https://github.com/0xKobold/pi-gateway) with config-based UID allowlisting.
