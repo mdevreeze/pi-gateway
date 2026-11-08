@@ -22,6 +22,8 @@ export interface WhatsAppConfig extends PlatformConfig {
   startupTimeoutMs?: number;
   /** Maximum strict notify messages buffered before callbacks are installed. */
   startupIngressCapacity?: number;
+  /** Independently configured owner PN; enables owner-only LID binding via a fresh USync query. */
+  ownerJid?: string;
 }
 
 /** Trusted test/host injection; production uses the optional Baileys peer. */
@@ -35,15 +37,34 @@ const silentLogger: any = {
   child() { return silentLogger; },
 };
 
-/** Conservative mapping only; actual Baileys identity semantics still require platform verification. */
-export function mapStrictWhatsAppMessage(msg: any): PlatformMessage | undefined {
+export interface WhatsAppOwnerBinding { ownerJid: string; ownerLid: string }
+
+// Baileys cleanMessage() normalizes absent participants to the empty string.
+const hasParticipant = (value: unknown): boolean => value != null && value !== "";
+
+/** Only the trusted adapter may supply a binding obtained by querying the configured owner. */
+export function mapStrictWhatsAppMessage(msg: any, binding?: WhatsAppOwnerBinding): PlatformMessage | undefined {
   const key = msg?.key;
-  const jid = key?.remoteJid;
-  if (!key || key.fromMe !== false || typeof key.id !== "string" || !key.id.trim() ||
+  let jid = key?.remoteJid;
+  if (binding) {
+    if (!/^[0-9]+@s\.whatsapp\.net$/.test(binding.ownerJid) || !/^[0-9]+@lid$/.test(binding.ownerLid)) return undefined;
+    if (jid === binding.ownerLid || jid === binding.ownerJid) {
+      const isLid = jid === binding.ownerLid;
+      const expectedAlt = isLid ? binding.ownerJid : binding.ownerLid;
+      if (hasParticipant(key.participant) || hasParticipant(key.participantAlt) || hasParticipant(msg.participant) ||
+          (key.remoteJidAlt != null && key.remoteJidAlt !== expectedAlt) ||
+          (key.addressingMode != null && key.addressingMode !== (isLid ? "lid" : "pn"))) return undefined;
+      // Preserve the original message ID; canonicalize only a server-verified owner pair.
+      jid = binding.ownerJid;
+    } else if (key?.remoteJidAlt != null) return undefined;
+  }
+  const boundOwner = !!binding && jid === binding.ownerJid &&
+    (key?.remoteJid === binding.ownerJid || key?.remoteJid === binding.ownerLid);
+  if (!key || msg.broadcast === true || key.fromMe !== false || typeof key.id !== "string" || !key.id.trim() ||
       key.id !== key.id.trim() || /[\u0000-\u001f\u007f]/.test(key.id) || key.id.length > 512 ||
       typeof jid !== "string" || !/^[0-9]+@s\.whatsapp\.net$/.test(jid) ||
-      (key.participant != null && key.participant !== jid) ||
-      key.remoteJidAlt != null || key.participantAlt != null || msg.participant != null) return undefined;
+      (hasParticipant(key.participant) && key.participant !== jid) ||
+      (!boundOwner && key.remoteJidAlt != null) || hasParticipant(key.participantAlt) || hasParticipant(msg.participant)) return undefined;
   const content = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption;
   if (typeof content !== "string" || !content.trim() || content.length > 65536) return undefined;
   return { id: key.id, platform: "whatsapp", channelId: jid, userId: jid, content,
@@ -63,6 +84,10 @@ export class WhatsAppAdapter extends BaseAdapter {
   
   private sock: any = null;
   private connected = false;
+  private connectionFailure: string | undefined;
+  private ownerBinding: WhatsAppOwnerBinding | undefined;
+  private queryOwnerBinding: (() => Promise<any>) | undefined;
+  private messageDiagnostics = { mapped: 0, lid: 0, alternateIdentity: 0, self: 0, unsupported: 0, nonNotify: 0 };
   private qrCode: string | null = null;
   private readonly loadBaileys: () => Promise<any>;
   private strictListeners: Array<[string, (...args: any[]) => void]> = [];
@@ -84,6 +109,10 @@ export class WhatsAppAdapter extends BaseAdapter {
       ...config,
     };
     this.loadBaileys = dependencies?.loadBaileys ?? (() => import("@whiskeysockets/baileys"));
+    if (this.config.ownerJid != null && (!this.config.strictBackendMessages ||
+        typeof this.config.ownerJid !== "string" || !/^[0-9]+@s\.whatsapp\.net$/.test(this.config.ownerJid))) {
+      throw new Error("Expected strict WhatsApp owner direct JID");
+    }
     if (this.config.strictBackendMessages && (!Number.isSafeInteger(this.config.startupTimeoutMs ?? 30000) ||
         (this.config.startupTimeoutMs ?? 30000) < 1 || (this.config.startupTimeoutMs ?? 30000) > 2147483647 ||
         !Number.isSafeInteger(this.config.maxMessageLength) || this.config.maxMessageLength! < 1 ||
@@ -106,6 +135,16 @@ export class WhatsAppAdapter extends BaseAdapter {
         ...(this.config.strictBackendMessages ? { logger: silentLogger } : {}),
       });
 
+      if (this.config.ownerJid) {
+        // Query the configured PN directly. Never infer authority from an incoming
+        // remoteJidAlt or the SDK's cache (which can be populated by received events).
+        const owner = this.config.ownerJid;
+        this.queryOwnerBinding = () => this.sock.executeUSyncQuery(
+          new baileys.USyncQuery().withLIDProtocol().withContext("background")
+            .withUser(new baileys.USyncUser().withId(owner)),
+        );
+      }
+
       const on = (event: string, listener: (...args: any[]) => void) => {
         this.sock.ev.on(event, listener);
         if (this.config.strictBackendMessages) this.strictListeners.push([event, listener]);
@@ -120,11 +159,12 @@ export class WhatsAppAdapter extends BaseAdapter {
       });
 
       // Handle connection update
-      on("connection.update", ({ qr, connection }: any) => {
+      on("connection.update", ({ qr, connection, lastDisconnect }: any) => {
         if (qr) {
           this.qrCode = qr;
         }
         if (connection === "open") {
+          this.connectionFailure = undefined;
           this.connected = true;
           this.qrCode = null;
           this.wakeWait?.();
@@ -132,7 +172,20 @@ export class WhatsAppAdapter extends BaseAdapter {
         }
         if (connection === "close") {
           this.connected = false;
-          if (this.config.strictBackendMessages) this.cancelWait?.();
+          this.ownerBinding = undefined;
+          if (this.config.strictBackendMessages) {
+            // Only fixed labels leave the adapter, never exception text or payloads.
+            const code = lastDisconnect?.error?.output?.statusCode;
+            const reasons = new Map<number, string>([
+              [401, "logged-out"], [403, "forbidden"], [408, "connection-lost"],
+              [411, "multidevice-mismatch"], [428, "connection-closed"],
+              [440, "connection-replaced"], [500, "bad-session"],
+              [503, "service-unavailable"], [515, "restart-required"],
+            ]);
+            this.connectionFailure = reasons.get(code) ?? "unknown-disconnect";
+            this.qrCode = null;
+            this.cancelWait?.();
+          }
           logger.info("[WhatsApp] Disconnected");
         }
       });
@@ -149,13 +202,19 @@ export class WhatsAppAdapter extends BaseAdapter {
       // Handle messages
       on("messages.upsert", ({ messages, type }: any) => {
         // History/append is deliberately dropped; no durable offline inbox exists.
-        if (this.config.strictBackendMessages && type !== "notify") return;
+        if (this.config.strictBackendMessages && type !== "notify") {
+          this.messageDiagnostics.nonNotify++;
+          return;
+        }
         if (Array.isArray(messages)) this.handleMessages(messages);
       });
 
       logger.info("[WhatsApp] Initializing...");
     } catch (err) {
-      if (this.config.strictBackendMessages) throw new Error("WhatsApp initialization failed; ensure the optional @whiskeysockets/baileys peer is installed and configured");
+      if (this.config.strictBackendMessages) {
+        this.connectionFailure = "initialization-failed";
+        throw new Error("WhatsApp initialization failed; ensure the optional @whiskeysockets/baileys peer is installed and configured");
+      }
       logger.error("[WhatsApp] Failed to initialize:", err);
       throw err;
     }
@@ -164,10 +223,18 @@ export class WhatsAppAdapter extends BaseAdapter {
   private handleMessages(messages: any[]): void {
     for (const msg of messages) {
       if (this.config.strictBackendMessages) {
-        const message = mapStrictWhatsAppMessage(msg);
+        const message = mapStrictWhatsAppMessage(msg, this.ownerBinding);
         if (message) {
+          this.messageDiagnostics.mapped++;
           if (this.strictCallbacksReady) void this.emitMessage(message);
           else if (!this.strictStopPromise && this.startupMessages.length < (this.config.startupIngressCapacity ?? 32)) this.startupMessages.push(message);
+        } else {
+          // Diagnostics describe rejection categories only, not identities or content.
+          const key = msg?.key;
+          if (key?.fromMe === true) this.messageDiagnostics.self++;
+          else if (typeof key?.remoteJid === "string" && key.remoteJid.endsWith("@lid")) this.messageDiagnostics.lid++;
+          else if (key?.remoteJidAlt != null || key?.participantAlt != null) this.messageDiagnostics.alternateIdentity++;
+          else this.messageDiagnostics.unsupported++;
         }
         continue;
       }
@@ -208,11 +275,10 @@ export class WhatsAppAdapter extends BaseAdapter {
     await super.start(callbacks);
     
     if (this.config.strictBackendMessages) {
-      if (!this.running) throw new Error("WhatsApp startup cancelled");
+      if (!this.running || this.connectionFailure) throw new Error("WhatsApp startup cancelled");
       this.strictCallbacksReady = true;
       for (const message of this.startupMessages.splice(0)) void this.emitMessage(message);
-      if (this.connected) return;
-      await new Promise<void>((resolve, reject) => {
+      if (!this.connected) await new Promise<void>((resolve, reject) => {
         let done = false;
         const finish = (error?: string) => {
           if (done) return;
@@ -224,6 +290,8 @@ export class WhatsAppAdapter extends BaseAdapter {
         this.cancelWait = () => finish("WhatsApp startup cancelled");
         if (this.connected) finish();
       });
+      if (this.config.ownerJid) await this.bindOwnerIdentity();
+      if (!this.running || !this.connected || this.strictStopPromise) throw new Error("WhatsApp startup cancelled");
       return;
     }
     // Wait for connection
@@ -235,6 +303,34 @@ export class WhatsAppAdapter extends BaseAdapter {
 
     if (!this.connected) {
       logger.warn("[WhatsApp] Not yet connected - waiting for QR scan");
+    }
+  }
+
+  private async bindOwnerIdentity(): Promise<void> {
+    try {
+      const result = await new Promise<any>((resolve, reject) => {
+        let done = false;
+        const finish = (value?: any, failed = false) => {
+          if (done) return;
+          done = true; clearTimeout(timer); this.cancelWait = undefined;
+          if (failed) reject(new Error("WhatsApp owner lookup failed")); else resolve(value);
+        };
+        const timer = setTimeout(() => finish(undefined, true), this.config.startupTimeoutMs ?? 30000);
+        this.cancelWait = () => finish(undefined, true);
+        void Promise.resolve().then(() => this.queryOwnerBinding!()).then(
+          value => finish(value), () => finish(undefined, true),
+        );
+      });
+      const owner = this.config.ownerJid!;
+      if (!this.running || !this.connected || this.strictStopPromise || !Array.isArray(result?.list) ||
+          result.list.length !== 1 || result.list[0]?.id !== owner ||
+          typeof result.list[0]?.lid !== "string" || !/^[0-9]+@lid$/.test(result.list[0].lid)) {
+        throw new Error("WhatsApp owner lookup failed");
+      }
+      this.ownerBinding = { ownerJid: owner, ownerLid: result.list[0].lid };
+    } catch {
+      if (!this.connectionFailure) this.connectionFailure = "owner-lookup-failed";
+      throw new Error("WhatsApp owner lookup failed");
     }
   }
 
@@ -267,6 +363,8 @@ export class WhatsAppAdapter extends BaseAdapter {
         this.strictCallbacksReady = false;
         this.sock = null;
         this.connected = false;
+        this.ownerBinding = undefined;
+        this.queryOwnerBinding = undefined;
         this.qrCode = null;
         await super.stop();
         await this.credsWrites;
@@ -291,7 +389,8 @@ export class WhatsAppAdapter extends BaseAdapter {
       : content;
 
     try {
-      const result = await this.sock.sendMessage(channelId, { text });
+      const destination = this.ownerBinding?.ownerJid === channelId ? this.ownerBinding.ownerLid : channelId;
+      const result = await this.sock.sendMessage(destination, { text });
       return result?.key?.id || this.generateMessageId();
     } catch (err) {
       if (this.config.strictBackendMessages) throw new Error("WhatsApp backend send failed");
@@ -412,6 +511,16 @@ export class WhatsAppAdapter extends BaseAdapter {
   async getContact(jid: string): Promise<WhatsAppContact | null> {
     const contacts = await this.getContacts();
     return contacts.find(c => c.id === jid) || null;
+  }
+
+  /** Aggregate observations only; no message text, IDs, phone numbers or QR data. */
+  getMessageDiagnostics(): { mapped: number; lid: number; alternateIdentity: number; self: number; unsupported: number; nonNotify: number } {
+    return { ...this.messageDiagnostics };
+  }
+
+  /** Sanitized failure survives stop() so a host can diagnose failed startup. */
+  getConnectionFailure(): string | undefined {
+    return this.connectionFailure;
   }
 
   getQrCode(): string | null {

@@ -47,6 +47,7 @@
     "prepublishOnly": "rm -rf dist && tsc"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "better-sqlite3": "^12.11.1",
     "ws": "^8.18.0"
   },
@@ -54,17 +55,12 @@
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.19.37",
     "@types/ws": "^8.18.1",
-    "@whiskeysockets/baileys": "^7.0.0-rc13",
     "tsx": "^4.19.0",
     "typescript": "^6.0.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.3",
-    "@sinclair/typebox": ">=0.32.0",
-    "@whiskeysockets/baileys": "^7.0.0-rc13"
-  },
-  "peerDependenciesMeta": {
-    "@whiskeysockets/baileys": { "optional": true }
+    "@sinclair/typebox": ">=0.32.0"
   },
   "pi": {
     "extensions": [

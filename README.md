@@ -30,7 +30,9 @@ Or clone and build manually:
 ```bash
 git clone https://github.com/gamalan/pi-gateway.git
 cd pi-gateway
-npm install && npm run build
+npm ci --ignore-scripts
+npm rebuild better-sqlite3
+npm run build && npm test
 pi install .
 ```
 

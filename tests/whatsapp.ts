@@ -7,7 +7,7 @@ import { join } from "node:path";
 // logger resolves HOME at import time; never touch the developer's Gateway state.
 const home = mkdtempSync(join(tmpdir(), "gateway-whatsapp-test-"));
 process.env.HOME = home;
-const { WhatsAppAdapter } = await import("../src/adapters/whatsapp.js");
+const { WhatsAppAdapter, mapStrictWhatsAppMessage } = await import("../src/adapters/whatsapp.js");
 const { createBackendHost } = await import("../src/backend.js");
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 const jid = "123@s.whatsapp.net";
@@ -18,11 +18,23 @@ function fake() {
   const sent: any[] = [];
   let opts: any; let logouts = 0; let ends = 0; let failEnd = false; let failSend = false;
   let save: () => Promise<void> = async () => {};
-  const sock = { ev, end: () => { ends++; if (failEnd) throw Error("private end"); }, logout: async () => { logouts++; },
+  const queries: any[] = [];
+  let query: () => Promise<any> = async () => ({ list: [{ id: jid, lid: "777@lid" }] });
+  class USyncUser {
+    id?: string;
+    withId(id: string) { this.id = id; return this; }
+  }
+  class USyncQuery {
+    users: USyncUser[] = []; lid = false; context?: string;
+    withLIDProtocol() { this.lid = true; return this; }
+    withContext(context: string) { this.context = context; return this; }
+    withUser(user: USyncUser) { this.users.push(user); return this; }
+  }
+  const sock = { ev, executeUSyncQuery: async (q: any) => { queries.push(q); return query(); }, end: () => { ends++; if (failEnd) throw Error("private end"); }, logout: async () => { logouts++; },
     sendMessage: async (channel: string, payload: any) => { if (failSend) throw Error("private send"); sent.push({ channel, payload }); return { key: { id: "sent" } }; } };
-  const dependencies = { loadBaileys: async () => ({ useMultiFileAuthState: async () => ({ state: {}, saveCreds: () => save() }),
+  const dependencies = { loadBaileys: async () => ({ USyncQuery, USyncUser, useMultiFileAuthState: async () => ({ state: {}, saveCreds: () => save() }),
     makeWASocket: (options: any) => { opts = options; return sock; } }) };
-  return { ev, sent, dependencies, get options() { return opts; }, get logouts() { return logouts; }, get ends() { return ends; },
+  return { ev, sent, queries, dependencies, setQuery(fn: () => Promise<any>) { query = fn; }, get options() { return opts; }, get logouts() { return logouts; }, get ends() { return ends; },
     setSave(fn: () => Promise<void>) { save = fn; }, setFailEnd(v: boolean) { failEnd = v; }, setFailSend(v: boolean) { failSend = v; } };
 }
 try {
@@ -74,6 +86,11 @@ try {
   const disconnected = fake(); const a5 = new WhatsAppAdapter(config, disconnected.dependencies);
   await a5.initialize(); const interrupted = a5.start({ onMessage: async () => {} }); const interruptedResult = assert.rejects(interrupted, /cancelled/);
   await tick(); disconnected.ev.emit("connection.update", { connection: "close" }); await interruptedResult; await a5.stop();
+  const earlyClose = fake(); const early = new WhatsAppAdapter(config, earlyClose.dependencies);
+  await early.initialize();
+  earlyClose.ev.emit("connection.update", { connection: "close", lastDisconnect: { error: { output: { statusCode: 401 } } } });
+  await assert.rejects(early.start({ onMessage: async () => {} }), /cancelled/); await early.stop();
+  assert.equal(early.getConnectionFailure(), "logged-out");
   assert.throws(() => new WhatsAppAdapter({ ...config, startupTimeoutMs: 0 }, timeout.dependencies), /Invalid/);
   const buffered = fake(); const limited = new WhatsAppAdapter({ ...config, startupIngressCapacity: 1 }, buffered.dependencies);
   const bufferedIds: string[] = []; await limited.initialize();
@@ -88,6 +105,24 @@ try {
   assert.ok(timedErrors.includes("startup")); assert.equal(timedHostSource.ends, 1);
   const missing = new WhatsAppAdapter(config, { loadBaileys: async () => { throw Error("private-import-secret"); } });
   await assert.rejects(missing.initialize(), /optional @whiskeysockets\/baileys peer/);
+  assert.equal(missing.getConnectionFailure(), "initialization-failed");
+
+  // Fixed diagnostics survive host cleanup and never expose raw error data.
+  for (const [code, reason] of [[515, "restart-required"], [401, "logged-out"],
+    [403, "forbidden"], [408, "connection-lost"], [411, "multidevice-mismatch"],
+    [428, "connection-closed"], [440, "connection-replaced"], [500, "bad-session"],
+    [503, "service-unavailable"], [999, "unknown-disconnect"],
+    ["private-disconnect-secret", "unknown-disconnect"]] as const) {
+    const source = fake(); const diagnostic = new WhatsAppAdapter(config, source.dependencies);
+    await diagnostic.initialize();
+    const pending = diagnostic.start({ onMessage: async () => {} });
+    const rejected = assert.rejects(pending, /cancelled/); await tick();
+    source.ev.emit("connection.update", { qr: "private-qr-secret", connection: "close",
+      lastDisconnect: { error: { message: "private-disconnect-secret", output: { statusCode: code } } } });
+    await rejected; await diagnostic.stop();
+    assert.equal(diagnostic.getConnectionFailure(), reason);
+    assert.equal(diagnostic.getQrCode(), null);
+  }
 
   // Strict notify ingress during connection is bounded by the host and waits for readiness.
   const startup = fake(); const actual = new WhatsAppAdapter(config, startup.dependencies);
@@ -109,6 +144,88 @@ try {
   host2.stopIngress(); await Promise.all([host2Rejection, host2.close()]);
   assert.ok(lifecycleErrors.includes("startup")); assert.equal(cancelled.ends, 1); assert.equal(cancelled.sent.length, 0);
 
+  // Diagnose dropped input without changing the conservative mapping or exposing IDs.
+  const observedSource = fake(); const observedAdapter = new WhatsAppAdapter(config, observedSource.dependencies);
+  await observedAdapter.initialize();
+  observedSource.ev.emit("messages.upsert", { type: "append", messages: [raw("private-history")] });
+  observedSource.ev.emit("messages.upsert", { type: "notify", messages: [
+    raw("mapped"),
+    { ...raw("private-lid"), key: { ...raw("private-lid").key, remoteJid: "123@lid", remoteJidAlt: jid } },
+    { ...raw("private-alt"), key: { ...raw("private-alt").key, remoteJidAlt: "123@lid" } },
+    { ...raw("private-self"), key: { ...raw("private-self").key, fromMe: true } },
+    { ...raw("private-invalid"), message: {} },
+  ] });
+  const snapshot = observedAdapter.getMessageDiagnostics();
+  assert.deepEqual(snapshot, { mapped: 1, lid: 1, alternateIdentity: 1, self: 1, unsupported: 1, nonNotify: 1 });
+  snapshot.mapped = 999;
+  assert.equal(observedAdapter.getMessageDiagnostics().mapped, 1);
+  await observedAdapter.stop();
+
+  // Bind only the independently configured owner, using a fresh server query.
+  const boundSource = fake(); const bound = new WhatsAppAdapter({ ...config, ownerJid: jid }, boundSource.dependencies);
+  const boundIncoming: any[] = [];
+  await bound.initialize(); const boundStart = bound.start({ onMessage: async m => { boundIncoming.push(m); } });
+  await tick(); boundSource.ev.emit("connection.update", { connection: "open" }); await boundStart;
+  assert.equal(boundSource.queries.length, 1);
+  assert.equal(boundSource.queries[0].lid, true);
+  assert.equal(boundSource.queries[0].context, "background");
+  assert.deepEqual(boundSource.queries[0].users.map((u: any) => u.id), [jid]);
+  const lidMessage = { ...raw("lid-original"), key: { ...raw("lid-original").key, remoteJid: "777@lid", remoteJidAlt: jid, addressingMode: "lid" } };
+  // Exercise the real SDK cleanup step, not just an idealized event fixture.
+  const { cleanMessage } = await import("@whiskeysockets/baileys");
+  const cleanedLid: any = structuredClone(lidMessage);
+  cleanMessage(cleanedLid, "555@s.whatsapp.net", "555@lid");
+  assert.equal(cleanedLid.key.participant, "");
+  boundSource.ev.emit("messages.upsert", { type: "notify", messages: [cleanedLid] });
+  assert.equal(boundIncoming.length, 1);
+  assert.equal(boundIncoming[0].id, "lid-original");
+  assert.equal(boundIncoming[0].channelId, jid); assert.equal(boundIncoming[0].userId, jid);
+  await bound.sendMessage(jid, "ok"); assert.equal(boundSource.sent[0].channel, "777@lid");
+  await bound.stop();
+
+  const binding = { ownerJid: jid, ownerLid: "777@lid" };
+  assert.ok(mapStrictWhatsAppMessage(cleanedLid, binding));
+  assert.ok(mapStrictWhatsAppMessage({ ...cleanedLid, participant: "", key: { ...cleanedLid.key, participantAlt: "" } }, binding));
+  const cleanedPn: any = structuredClone(raw("cleaned-pn"));
+  cleanMessage(cleanedPn, "555@s.whatsapp.net", "555@lid");
+  assert.ok(mapStrictWhatsAppMessage(cleanedPn));
+  assert.ok(mapStrictWhatsAppMessage({ ...lidMessage, key: { ...lidMessage.key, remoteJidAlt: undefined } }, binding));
+  assert.ok(mapStrictWhatsAppMessage({ ...raw("pn-alt"), key: { ...raw("pn-alt").key, remoteJidAlt: "777@lid", addressingMode: "pn" } }, binding));
+  for (const patch of [
+    { remoteJid: "888@lid" }, { remoteJid: "777@g.us" }, { remoteJid: "777:1@lid" },
+    { remoteJidAlt: "999@s.whatsapp.net" }, { remoteJidAlt: "777@lid" },
+    { fromMe: true }, { fromMe: undefined }, { id: "" }, { participant: "777@lid" },
+    { participantAlt: jid }, { participant: " " }, { participantAlt: " " }, { addressingMode: "pn" },
+  ]) assert.equal(mapStrictWhatsAppMessage({ ...lidMessage, key: { ...lidMessage.key, ...patch } }, binding), undefined);
+  assert.equal(mapStrictWhatsAppMessage(lidMessage), undefined);
+  assert.equal(mapStrictWhatsAppMessage({ ...lidMessage, broadcast: true }, binding), undefined);
+  assert.equal(mapStrictWhatsAppMessage({ ...lidMessage, participant: "777@lid" }, binding), undefined);
+  assert.equal(mapStrictWhatsAppMessage(lidMessage, { ...binding, ownerLid: "777:1@lid" }), undefined);
+  assert.throws(() => new WhatsAppAdapter({ ...config, ownerJid: "777@lid" }, fake().dependencies), /owner direct JID/);
+
+  // Missing, conflicting or ambiguous lookup results fail closed; no inbound IDs are learned.
+  for (const result of [undefined, { list: [] }, { list: [{ id: "999@s.whatsapp.net", lid: "777@lid" }] },
+    { list: [{ id: jid, lid: "777:1@lid" }] }, { list: [{ id: jid, lid: "777@lid" }, { id: jid, lid: "888@lid" }] }]) {
+    const source = fake(); source.setQuery(async () => result);
+    const rejected = new WhatsAppAdapter({ ...config, ownerJid: jid }, source.dependencies);
+    await rejected.initialize(); source.ev.emit("connection.update", { connection: "open" });
+    await assert.rejects(rejected.start({ onMessage: async () => {} }), /owner lookup failed/);
+    assert.equal(rejected.getConnectionFailure(), "owner-lookup-failed"); await rejected.stop();
+  }
+  const lookupTimeout = fake(); lookupTimeout.setQuery(() => new Promise(() => {}));
+  const timedLookup = new WhatsAppAdapter({ ...config, startupTimeoutMs: 10, ownerJid: jid }, lookupTimeout.dependencies);
+  await timedLookup.initialize(); lookupTimeout.ev.emit("connection.update", { connection: "open" });
+  await assert.rejects(timedLookup.start({ onMessage: async () => {} }), /owner lookup failed/); await timedLookup.stop();
+
+  const lookupCancelled = fake(); let releaseLookup!: (value: any) => void;
+  lookupCancelled.setQuery(() => new Promise(resolve => { releaseLookup = resolve; }));
+  const cancelledLookup = new WhatsAppAdapter({ ...config, ownerJid: jid }, lookupCancelled.dependencies);
+  await cancelledLookup.initialize(); lookupCancelled.ev.emit("connection.update", { connection: "open" });
+  const pendingLookup = assert.rejects(cancelledLookup.start({ onMessage: async () => {} }), /owner lookup failed/);
+  await tick(); await cancelledLookup.stop(); await pendingLookup;
+  releaseLookup({ list: [{ id: jid, lid: "777@lid" }] }); await tick();
+  await assert.rejects(cancelledLookup.sendMessage(jid, "never"), /not connected/);
+
   // Legacy still accepts non-notify messages, truncates, and logs out on stop.
   const legacy = fake(); const legacyAdapter = new WhatsAppAdapter({ enabled: true, platform: "whatsapp", maxMessageLength: 5 }, legacy.dependencies);
   const oldIncoming: any[] = []; await legacyAdapter.initialize();
@@ -121,6 +238,6 @@ try {
 
   const logPath = join(home, ".pi", "gateway", "gateway.log");
   const logText = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
-  for (const secret of ["private-qr-secret", "private-qr-2", "private-node-secret", "private-child-secret", "private-jid", "private-creds-secret", "private-import-secret"]) assert.equal(logText.includes(secret), false);
+  for (const secret of ["private-qr-secret", "private-qr-2", "private-node-secret", "private-child-secret", "private-jid", "private-creds-secret", "private-import-secret", "private-disconnect-secret"]) assert.equal(logText.includes(secret), false);
   console.log("WhatsApp adapter tests passed");
 } finally { rmSync(home, { recursive: true, force: true }); }
