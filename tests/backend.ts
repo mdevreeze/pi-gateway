@@ -48,14 +48,14 @@ class Fake extends BaseAdapter {
 }
 const adapter = new Fake();
 const errors: BackendError[] = [];
-let auth = 0, calls = 0;
+let auth = 0, calls = 0, delivered = 0;
 let release!: () => void;
 let block = false;
 const host = createBackendHost({ adapter, capacity: 2, allow: m => [jid, "456@s.whatsapp.net"].includes(m.userId),
   backend: { authorize: m => { auth++; return m.messageId !== "deny"; }, submit: async m => {
     calls++; if (block) await new Promise<void>(resolve => { release = resolve; });
     if (m.text === "throw") throw Error("private"); return `answer ${m.text}`;
-  } }, onError: e => errors.push(e) });
+  } }, onError: e => errors.push(e), onDelivered: () => { delivered++; } });
 await host.start();
 const emit = (id: string, content: string) => adapter.emit(mapStrictWhatsAppMessage(raw(id, content))!);
 await adapter.emit(mapStrictWhatsAppMessage({ ...raw("other", "/restart"), key: { id: "other", remoteJid: "999@s.whatsapp.net", fromMe: false } })!);
@@ -64,12 +64,13 @@ await emit("deny", "/model evil");
 assert.equal(auth, 1); assert.equal(calls, 0); assert.deepEqual(adapter.sent, []);
 await emit("ok", "/model evil"); await emit("ok", "Callback: model:evil"); await emit("ok", "/restart");
 assert.equal(calls, 0);
-await emit("ok", "hello"); assert.deepEqual(adapter.sent, [`${jid}:answer hello`]);
+await emit("ok", "hello"); assert.deepEqual(adapter.sent, [`${jid}:answer hello`]); assert.equal(delivered, 1);
 const groupMapped = mapStrictWhatsAppGroupMessage(groupRaw("group-ok"), groupContext)!;
 await adapter.emit(groupMapped);
 assert.equal(calls, 2); assert.equal(adapter.sent.at(-1), `${group}:answer hello`);
 await emit("err", "throw"); assert.equal(errors.at(-1), "backend");
 adapter.fail = true; await emit("send", "hi"); assert.equal(errors.at(-1), "delivery"); adapter.fail = false;
+assert.equal(delivered, 2); // direct and group replies; neither the backend error nor the failed send counts
 block = true;
 const first = emit("a", "one");
 await new Promise(resolve => setTimeout(resolve, 0));

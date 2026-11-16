@@ -32,6 +32,8 @@ export interface BackendHostOptions {
   maxResponseLength?: number;
   /** Sanitized operational signals, never message contents or exception objects. */
   onError?: (code: BackendError) => void;
+  /** A reply was handed to WhatsApp without an error. Carries nothing about the message. */
+  onDelivered?: () => void;
 }
 
 export function createBackendWhatsAppAdapter(config: WhatsAppConfig): WhatsAppAdapter {
@@ -108,7 +110,8 @@ export function createBackendHost(options: BackendHostOptions) {
       if (state !== "running") { report("shutdown"); return; }
       if (result === undefined) return;
       if (typeof result !== "string" || !result.trim()) { report("backend"); return; }
-      try { await adapter.sendMessage(message.channelId, result.length > maxResponseLength ? overflowNotice : result); } catch { report("delivery"); }
+      try { await adapter.sendMessage(message.channelId, result.length > maxResponseLength ? overflowNotice : result); } catch { report("delivery"); return; }
+      try { options.onDelivered?.(); } catch { /* observer cannot break dispatch */ }
     });
     tail = work.catch(() => { report("backend"); }).finally(() => { pending--; });
     // An adapter may await its callback during start; never wait for readiness here.
