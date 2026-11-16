@@ -56,6 +56,9 @@ const isPnJid = (value: unknown): value is string => typeof value === "string" &
 const isLidJid = (value: unknown): value is string => typeof value === "string" && /^[0-9]+@lid$/.test(value);
 const isGroupJid = (value: unknown): value is string => typeof value === "string" && /^[0-9-]+@g\.us$/.test(value);
 
+/** Drop the device part of an own-account JID: "123:7@s.whatsapp.net" becomes "123@s.whatsapp.net". */
+const bareJid = (value: unknown): unknown => typeof value === "string" ? value.replace(/^([0-9]+):[0-9]+@/, "$1@") : value;
+
 /** Group metadata must not stall ingress: bound the lookup and reuse it briefly. */
 const GROUP_CONTEXT_TIMEOUT_MS = 8000;
 const GROUP_CONTEXT_TTL_MS = 15000;
@@ -354,8 +357,11 @@ export class WhatsAppAdapter extends BaseAdapter {
       if (!metadata || metadata.id !== groupJid) return undefined;
       const creator = isPnJid(metadata.ownerPn) ? metadata.ownerPn : isPnJid(metadata.owner) ? metadata.owner : undefined;
       if (!creator || !Array.isArray(metadata.participants)) return undefined;
+      // Baileys reports its own account as "<user>:<device>@server"; members and mentions use the bare form.
       const botJids = [this.sock.user?.id, this.sock.user?.lid, this.sock.user?.phoneNumber]
-        .filter((jid: unknown): jid is string => isPnJid(jid) || isLidJid(jid));
+        .map(bareJid).filter((jid: unknown): jid is string => isPnJid(jid) || isLidJid(jid));
+      // Without the bot's own identity it would be judged as an unlisted member and never see a mention.
+      if (!botJids.length) return undefined;
       const participants: WhatsAppGroupParticipant[] = [];
       const unresolved: string[] = [];
       for (const participant of metadata.participants) {

@@ -36,11 +36,11 @@ function fake() {
     participants: [
       { id: jid, phoneNumber: jid },
       { id: "222@lid", phoneNumber: "222@s.whatsapp.net" },
-      { id: "999@lid", phoneNumber: "999@s.whatsapp.net" },
+      { id: "998@lid", phoneNumber: "999@s.whatsapp.net" },
     ],
   } : undefined;
-
-  const sock = { ev, user: { id: "999@lid", lid: "999@lid", phoneNumber: "999@s.whatsapp.net" }, groupMetadata,
+  // Baileys reports the bot's own identities with a device suffix and no phoneNumber field.
+  const sock = { ev, user: { id: "999:7@s.whatsapp.net", lid: "998:7@lid" }, groupMetadata,
     executeUSyncQuery: async (q: any) => { queries.push(q); return query(); }, end: () => { ends++; if (failEnd) throw Error("private end"); }, logout: async () => { logouts++; },
     sendMessage: async (channel: string, payload: any) => { if (failSend) throw Error("private send"); sent.push({ channel, payload }); return { key: { id: "sent" } }; } };
   const dependencies = { loadBaileys: async () => ({ USyncQuery, USyncUser, useMultiFileAuthState: async () => ({ state: {}, saveCreds: () => save() }),
@@ -68,7 +68,7 @@ try {
   assert.deepEqual(incoming.map(m => m.id), ["before-start", "original"]);
   assert.deepEqual(incoming[0].metadata, { chatType: "direct", stableMessageId: true });
   const groupRaw = { key: { id: "group-1", remoteJid: group, participant: "222@lid", fromMe: false },
-    message: { extendedTextMessage: { text: "hello bot", contextInfo: { mentionedJid: ["999@lid"] } } } };
+    message: { extendedTextMessage: { text: "hello bot", contextInfo: { mentionedJid: ["998@lid"] } } } };
   f.ev.emit("connection.update", { connection: "open" }); await starting;
   f.ev.emit("messages.upsert", { type: "notify", messages: [groupRaw] });
   await tick(); await tick();
