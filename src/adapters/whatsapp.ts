@@ -56,6 +56,25 @@ const isPnJid = (value: unknown): value is string => typeof value === "string" &
 const isLidJid = (value: unknown): value is string => typeof value === "string" && /^[0-9]+@lid$/.test(value);
 const isGroupJid = (value: unknown): value is string => typeof value === "string" && /^[0-9-]+@g\.us$/.test(value);
 
+/** Group metadata must not stall ingress: bound the lookup and reuse it briefly. */
+const GROUP_CONTEXT_TIMEOUT_MS = 8000;
+const GROUP_CONTEXT_TTL_MS = 15000;
+
+/** Bound a server lookup so a stalled socket can never hold up ingress or shutdown. */
+const withDeadline = async <T>(work: Promise<T>, ms: number): Promise<T | undefined> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), ms); }),
+    ]);
+  } catch {
+    return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
 /** Only the trusted adapter may supply a binding obtained by querying the configured owner. */
 export function mapStrictWhatsAppMessage(msg: any, binding?: WhatsAppOwnerBinding): PlatformMessage | undefined {
   const key = msg?.key;
@@ -142,6 +161,8 @@ export class WhatsAppAdapter extends BaseAdapter {
   private strictCallbacksReady = false;
   /** Serialize ingress so async group metadata lookups cannot bypass the startup bound. */
   private messageQueue: Promise<void> = Promise.resolve();
+  /** Short-lived group context cache: one lookup per group per window, never a stale member list. */
+  private groupContextCache = new Map<string, { at: number; context: WhatsAppGroupContext }>();
 
   constructor(config: WhatsAppConfig, dependencies?: WhatsAppDependencies) {
     super();
@@ -266,23 +287,23 @@ export class WhatsAppAdapter extends BaseAdapter {
   }
 
   private async handleMessages(messages: any[]): Promise<void> {
+    // Group messages need a server lookup. Do those lookups in parallel and dispatch direct
+    // messages immediately, so a slow group can never delay a direct reply.
+    const groupWork: Array<{ msg: any; groupJid: string; context: Promise<WhatsAppGroupContext | undefined> }> = [];
     for (const msg of messages) {
       if (this.config.strictBackendMessages) {
         const remoteJid = msg?.key?.remoteJid;
-        const message = isGroupJid(remoteJid)
-          ? mapStrictWhatsAppGroupMessage(msg, await this.groupContext(remoteJid))
-          : mapStrictWhatsAppMessage(msg, this.ownerBinding);
+        if (isGroupJid(remoteJid)) {
+          groupWork.push({ msg, groupJid: remoteJid, context: this.groupContext(remoteJid) });
+          continue;
+        }
+        const message = mapStrictWhatsAppMessage(msg, this.ownerBinding);
         if (message) {
           this.messageDiagnostics.mapped++;
           if (this.strictCallbacksReady) await this.emitMessage(message);
           else if (!this.strictStopPromise && this.startupMessages.length < (this.config.startupIngressCapacity ?? 32)) this.startupMessages.push(message);
         } else {
-          // Diagnostics describe rejection categories only, not identities or content.
-          const key = msg?.key;
-          if (key?.fromMe === true) this.messageDiagnostics.self++;
-          else if (typeof key?.remoteJid === "string" && key.remoteJid.endsWith("@lid")) this.messageDiagnostics.lid++;
-          else if (key?.remoteJidAlt != null || key?.participantAlt != null) this.messageDiagnostics.alternateIdentity++;
-          else this.messageDiagnostics.unsupported++;
+          this.countRejected(msg);
         }
         continue;
       }
@@ -302,13 +323,34 @@ export class WhatsAppAdapter extends BaseAdapter {
       };
       await this.emitMessage(message);
     }
+    for (const item of groupWork) {
+      const message = mapStrictWhatsAppGroupMessage(item.msg, await item.context);
+      if (message) {
+        this.messageDiagnostics.mapped++;
+        if (this.strictCallbacksReady) await this.emitMessage(message);
+        else if (!this.strictStopPromise && this.startupMessages.length < (this.config.startupIngressCapacity ?? 32)) this.startupMessages.push(message);
+      } else {
+        this.countRejected(item.msg);
+      }
+    }
+  }
+
+  /** Diagnostics describe rejection categories only, not identities or content. */
+  private countRejected(msg: any): void {
+    const key = msg?.key;
+    if (key?.fromMe === true) this.messageDiagnostics.self++;
+    else if (typeof key?.remoteJid === "string" && key.remoteJid.endsWith("@lid")) this.messageDiagnostics.lid++;
+    else if (key?.remoteJidAlt != null || key?.participantAlt != null) this.messageDiagnostics.alternateIdentity++;
+    else this.messageDiagnostics.unsupported++;
   }
 
   /** Fresh server metadata for a group: creator, canonical participants and the bot's own identities. */
   private async groupContext(groupJid: string): Promise<WhatsAppGroupContext | undefined> {
     if (!this.sock?.groupMetadata) return undefined;
+    const cached = this.groupContextCache.get(groupJid);
+    if (cached && Date.now() - cached.at < GROUP_CONTEXT_TTL_MS) return cached.context;
     try {
-      const metadata = await this.sock.groupMetadata(groupJid);
+      const metadata = await withDeadline<any>(this.sock.groupMetadata(groupJid), GROUP_CONTEXT_TIMEOUT_MS);
       if (!metadata || metadata.id !== groupJid) return undefined;
       const creator = isPnJid(metadata.ownerPn) ? metadata.ownerPn : isPnJid(metadata.owner) ? metadata.owner : undefined;
       if (!creator || !Array.isArray(metadata.participants)) return undefined;
@@ -333,7 +375,9 @@ export class WhatsAppAdapter extends BaseAdapter {
         if (pn) participants.push({ id: lid, pn });
       }
       if (!participants.length) return undefined;
-      return { creatorJid: creator, participants, botJids, membersResolved: unresolved.length === 0 };
+      const context = { creatorJid: creator, participants, botJids, membersResolved: unresolved.length === 0 };
+      this.groupContextCache.set(groupJid, { at: Date.now(), context });
+      return context;
     } catch {
       return undefined;
     }
@@ -343,16 +387,16 @@ export class WhatsAppAdapter extends BaseAdapter {
   private async resolveLidPhoneNumber(lid: string): Promise<string | undefined> {
     if (!isLidJid(lid)) return undefined;
     try {
-      const mapped = await this.sock?.signalRepository?.lidMapping?.getPNForLID?.(lid);
+      const mapped = await withDeadline(Promise.resolve(this.sock?.signalRepository?.lidMapping?.getPNForLID?.(lid)), 5000);
       if (isPnJid(mapped)) return mapped;
     } catch { /* fall through to a fresh query */ }
     if (!this.sock?.executeUSyncQuery) return undefined;
     try {
       const baileys = await this.loadBaileys();
-      const result = await this.sock.executeUSyncQuery(
+      const result = await withDeadline<any>(this.sock.executeUSyncQuery(
         new baileys.USyncQuery().withLIDProtocol().withContext("background")
           .withUser(new baileys.USyncUser().withLid(lid)),
-      );
+      ), 5000);
       const rows = Array.isArray(result?.list) ? result.list : [];
       for (const row of rows) {
         if (isPnJid(row?.id)) return row.id;
@@ -455,7 +499,7 @@ export class WhatsAppAdapter extends BaseAdapter {
         this.strictListeners = [];
         this.startupMessages = [];
         this.strictCallbacksReady = false;
-        await this.messageQueue.catch(() => {});
+        await withDeadline(this.messageQueue.catch(() => {}), 5000);
         this.sock = null;
         this.connected = false;
         this.ownerBinding = undefined;
