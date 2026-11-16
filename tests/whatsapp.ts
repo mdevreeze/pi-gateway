@@ -39,7 +39,8 @@ function fake() {
       { id: "999@lid", phoneNumber: "999@s.whatsapp.net" },
     ],
   } : undefined;
-  const sock = { ev, user: { id: "999@lid", lid: "999@lid" }, groupMetadata,
+
+  const sock = { ev, user: { id: "999@lid", lid: "999@lid", phoneNumber: "999@s.whatsapp.net" }, groupMetadata,
     executeUSyncQuery: async (q: any) => { queries.push(q); return query(); }, end: () => { ends++; if (failEnd) throw Error("private end"); }, logout: async () => { logouts++; },
     sendMessage: async (channel: string, payload: any) => { if (failSend) throw Error("private send"); sent.push({ channel, payload }); return { key: { id: "sent" } }; } };
   const dependencies = { loadBaileys: async () => ({ USyncQuery, USyncUser, useMultiFileAuthState: async () => ({ state: {}, saveCreds: () => save() }),
