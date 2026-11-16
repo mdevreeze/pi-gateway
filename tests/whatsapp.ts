@@ -180,7 +180,8 @@ try {
   ] });
   await tick(); await tick();
   const snapshot = observedAdapter.getMessageDiagnostics();
-  assert.deepEqual(snapshot, { mapped: 1, lid: 1, alternateIdentity: 1, self: 1, unsupported: 1, nonNotify: 1 });
+  assert.deepEqual(snapshot, { mapped: 1, lid: 1, alternateIdentity: 1, self: 1, unsupported: 1, nonNotify: 1,
+    groupMetadata: 0, groupCreator: 0, groupBotIdentity: 0, groupMembers: 0 });
   snapshot.mapped = 999;
   assert.equal(observedAdapter.getMessageDiagnostics().mapped, 1);
   await observedAdapter.stop();

@@ -41,7 +41,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "tsx tests/index.ts && tsx tests/backend.ts && tsx tests/whatsapp.ts",
+    "test": "tsx tests/index.ts && tsx tests/backend.ts && tsx tests/whatsapp.ts && tsx tests/whatsapp-groups.ts",
     "demo": "npx tsx tests/demo-server.ts",
     "client": "npx tsx tests/client-demo.ts",
     "prepublishOnly": "rm -rf dist && tsc"

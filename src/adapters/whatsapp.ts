@@ -10,6 +10,7 @@
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
 import { logger } from "../logger.js";
+import { isLidJid, isPnJid, isUserJid, pnJid, userJid, userJids, type PnJid, type UserJid } from "./whatsapp-jid.js";
 
 export interface WhatsAppConfig extends PlatformConfig {
   platform: "whatsapp";
@@ -52,12 +53,10 @@ export interface WhatsAppGroupContext {
 
 // Baileys cleanMessage() normalizes absent participants to the empty string.
 const hasParticipant = (value: unknown): boolean => value != null && value !== "";
-const isPnJid = (value: unknown): value is string => typeof value === "string" && /^[0-9]+@s\.whatsapp\.net$/.test(value);
-const isLidJid = (value: unknown): value is string => typeof value === "string" && /^[0-9]+@lid$/.test(value);
 const isGroupJid = (value: unknown): value is string => typeof value === "string" && /^[0-9-]+@g\.us$/.test(value);
 
-/** Drop the device part of an own-account JID: "123:7@s.whatsapp.net" becomes "123@s.whatsapp.net". */
-const bareJid = (value: unknown): unknown => typeof value === "string" ? value.replace(/^([0-9]+):[0-9]+@/, "$1@") : value;
+/** Why a group's context could not be established. Fixed labels: never identities or content. */
+export type WhatsAppGroupFailure = "metadata" | "creator" | "botIdentity" | "members";
 
 /** Group metadata must not stall ingress: bound the lookup and reuse it briefly. */
 const GROUP_CONTEXT_TIMEOUT_MS = 8000;
@@ -116,26 +115,30 @@ export function mapStrictWhatsAppGroupMessage(msg: any, context?: WhatsAppGroupC
   const key = msg?.key;
   if (!context || !isPnJid(context.creatorJid) || !Array.isArray(context.participants) ||
       !context.participants.length || !context.participants.every((p) => isPnJid(p.pn) && (isPnJid(p.id) || isLidJid(p.id))) ||
-      !Array.isArray(context.botJids) || !context.botJids.every((jid) => isPnJid(jid) || isLidJid(jid)) ||
+      !Array.isArray(context.botJids) || !context.botJids.length || !context.botJids.every(isUserJid) ||
       !isGroupJid(key?.remoteJid) || key.fromMe !== false || msg.broadcast === true ||
       typeof key.id !== "string" || !key.id.trim() || key.id !== key.id.trim() || /[\u0000-\u001f\u007f]/.test(key.id) || key.id.length > 512) return undefined;
-  const participant = key.participant;
-  if (!isPnJid(participant) && !isLidJid(participant)) return undefined;
+  // A message from a linked device carries that device in its sender identity.
+  const participant = userJid(key.participant);
+  if (!participant) return undefined;
   const resolved = context.participants.find((p) => p.id === participant || p.pn === participant);
   if (!resolved) return undefined;
   const content = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption;
   if (typeof content !== "string" || !content.trim() || content.length > 65536) return undefined;
   const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
-  const mentioned = Array.isArray(contextInfo?.mentionedJid) ? contextInfo.mentionedJid : [];
-  const quotedParticipant = contextInfo?.participant;
-  const addressed = mentioned.some((jid: unknown) => context.botJids.includes(jid as string)) ||
-    (typeof quotedParticipant === "string" && context.botJids.includes(quotedParticipant));
+  const mentioned = userJids(Array.isArray(contextInfo?.mentionedJid) ? contextInfo.mentionedJid : []);
+  const quotedParticipant = userJid(contextInfo?.participant);
+  const addressed = mentioned.some((jid) => context.botJids.includes(jid)) ||
+    (quotedParticipant !== undefined && context.botJids.includes(quotedParticipant));
   return { id: key.id, platform: "whatsapp", channelId: key.remoteJid, userId: resolved.pn, content,
     timestamp: msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now(),
     metadata: { chatType: "group", stableMessageId: true, addressed,
       groupCreator: context.creatorJid, groupParticipants: context.participants.map((p) => p.pn),
       groupMembersResolved: context.membersResolved !== false } };
 }
+
+const GROUP_FAILURE_COUNTERS = { metadata: "groupMetadata", creator: "groupCreator",
+  botIdentity: "groupBotIdentity", members: "groupMembers" } as const;
 
 interface WhatsAppContact {
   id: string;
@@ -152,7 +155,8 @@ export class WhatsAppAdapter extends BaseAdapter {
   private connectionFailure: string | undefined;
   private ownerBinding: WhatsAppOwnerBinding | undefined;
   private queryOwnerBinding: (() => Promise<any>) | undefined;
-  private messageDiagnostics = { mapped: 0, lid: 0, alternateIdentity: 0, self: 0, unsupported: 0, nonNotify: 0 };
+  private messageDiagnostics = { mapped: 0, lid: 0, alternateIdentity: 0, self: 0, unsupported: 0, nonNotify: 0,
+    groupMetadata: 0, groupCreator: 0, groupBotIdentity: 0, groupMembers: 0 };
   private qrCode: string | null = null;
   private readonly loadBaileys: () => Promise<any>;
   private strictListeners: Array<[string, (...args: any[]) => void]> = [];
@@ -292,7 +296,7 @@ export class WhatsAppAdapter extends BaseAdapter {
   private async handleMessages(messages: any[]): Promise<void> {
     // Group messages need a server lookup. Do those lookups in parallel and dispatch direct
     // messages immediately, so a slow group can never delay a direct reply.
-    const groupWork: Array<{ msg: any; groupJid: string; context: Promise<WhatsAppGroupContext | undefined> }> = [];
+    const groupWork: Array<{ msg: any; groupJid: string; context: Promise<WhatsAppGroupContext | WhatsAppGroupFailure> }> = [];
     for (const msg of messages) {
       if (this.config.strictBackendMessages) {
         const remoteJid = msg?.key?.remoteJid;
@@ -327,7 +331,14 @@ export class WhatsAppAdapter extends BaseAdapter {
       await this.emitMessage(message);
     }
     for (const item of groupWork) {
-      const message = mapStrictWhatsAppGroupMessage(item.msg, await item.context);
+      const context = await item.context;
+      if (typeof context === "string") {
+        // The group itself could not be read; say which part, instead of a generic drop.
+        if (item.msg?.key?.fromMe === true) this.messageDiagnostics.self++;
+        else this.messageDiagnostics[GROUP_FAILURE_COUNTERS[context]]++;
+        continue;
+      }
+      const message = mapStrictWhatsAppGroupMessage(item.msg, context);
       if (message) {
         this.messageDiagnostics.mapped++;
         if (this.strictCallbacksReady) await this.emitMessage(message);
@@ -348,53 +359,54 @@ export class WhatsAppAdapter extends BaseAdapter {
   }
 
   /** Fresh server metadata for a group: creator, canonical participants and the bot's own identities. */
-  private async groupContext(groupJid: string): Promise<WhatsAppGroupContext | undefined> {
-    if (!this.sock?.groupMetadata) return undefined;
+  private async groupContext(groupJid: string): Promise<WhatsAppGroupContext | WhatsAppGroupFailure> {
+    if (!this.sock?.groupMetadata) return "metadata";
     const cached = this.groupContextCache.get(groupJid);
     if (cached && Date.now() - cached.at < GROUP_CONTEXT_TTL_MS) return cached.context;
     try {
       const metadata = await withDeadline<any>(this.sock.groupMetadata(groupJid), GROUP_CONTEXT_TIMEOUT_MS);
-      if (!metadata || metadata.id !== groupJid) return undefined;
-      const creator = isPnJid(metadata.ownerPn) ? metadata.ownerPn : isPnJid(metadata.owner) ? metadata.owner : undefined;
-      if (!creator || !Array.isArray(metadata.participants)) return undefined;
-      // Baileys reports its own account as "<user>:<device>@server"; members and mentions use the bare form.
-      const botJids = [this.sock.user?.id, this.sock.user?.lid, this.sock.user?.phoneNumber]
-        .map(bareJid).filter((jid: unknown): jid is string => isPnJid(jid) || isLidJid(jid));
-      // Without the bot's own identity it would be judged as an unlisted member and never see a mention.
-      if (!botJids.length) return undefined;
+      if (!metadata || metadata.id !== groupJid || !Array.isArray(metadata.participants)) return "metadata";
+      const creator = pnJid(metadata.ownerPn) ?? pnJid(metadata.owner);
+      if (!creator) return "creator";
+      const botJids = userJids([this.sock.user?.id, this.sock.user?.lid, this.sock.user?.phoneNumber]);
       const participants: WhatsAppGroupParticipant[] = [];
-      const unresolved: string[] = [];
+      const unresolved: UserJid[] = [];
+      let botIsMember = false;
       for (const participant of metadata.participants) {
-        if (!participant || typeof participant.id !== "string") continue;
-        const pn = isPnJid(participant.phoneNumber) ? participant.phoneNumber : isPnJid(participant.id) ? participant.id : undefined;
+        const id = userJid(participant?.id);
+        if (!id) continue;
+        const pn: PnJid | undefined = pnJid(participant.phoneNumber) ?? pnJid(id);
+        const identities = userJids([id, participant.lid, pn]);
         // The bot's own account is a group member but never a participant to answer.
-        if (botJids.includes(participant.id) || botJids.includes(participant.lid ?? "") || botJids.includes(pn)) continue;
-        if (!pn) {
-          if (isLidJid(participant.id)) unresolved.push(participant.id);
-          continue;
-        }
-        participants.push({ id: participant.id, pn });
+        if (identities.some((jid) => botJids.includes(jid))) { botIsMember = true; continue; }
+        if (pn) participants.push({ id, pn });
+        else unresolved.push(id);
       }
+      // The bot only receives messages from groups it is in. If it cannot find itself among the members,
+      // its own identity is wrong, and it would be judged as a stranger and never notice a mention.
+      if (!botIsMember) return "botIdentity";
       // A LID-only member cannot be compared with a phone-number allow list until it is resolved.
+      let membersResolved = true;
       for (const lid of unresolved) {
         const pn = await this.resolveLidPhoneNumber(lid);
         if (pn) participants.push({ id: lid, pn });
+        else membersResolved = false;
       }
-      if (!participants.length) return undefined;
-      const context = { creatorJid: creator, participants, botJids, membersResolved: unresolved.length === 0 };
+      if (!participants.length) return "members";
+      const context = { creatorJid: creator, participants, botJids, membersResolved };
       this.groupContextCache.set(groupJid, { at: Date.now(), context });
       return context;
     } catch {
-      return undefined;
+      return "metadata";
     }
   }
 
   /** Resolve one LID to its phone-number JID: the socket's server-established mapping first, then a fresh query. */
-  private async resolveLidPhoneNumber(lid: string): Promise<string | undefined> {
+  private async resolveLidPhoneNumber(lid: string): Promise<PnJid | undefined> {
     if (!isLidJid(lid)) return undefined;
     try {
       const mapped = await withDeadline(Promise.resolve(this.sock?.signalRepository?.lidMapping?.getPNForLID?.(lid)), 5000);
-      if (isPnJid(mapped)) return mapped;
+      if (pnJid(mapped)) return pnJid(mapped);
     } catch { /* fall through to a fresh query */ }
     if (!this.sock?.executeUSyncQuery) return undefined;
     try {
@@ -405,9 +417,8 @@ export class WhatsAppAdapter extends BaseAdapter {
       ), 5000);
       const rows = Array.isArray(result?.list) ? result.list : [];
       for (const row of rows) {
-        if (isPnJid(row?.id)) return row.id;
-        if (isPnJid(row?.lid)) return row.lid;
-        if (isPnJid(row?.phone)) return row.phone;
+        const pn = pnJid(row?.id) ?? pnJid(row?.lid) ?? pnJid(row?.phone);
+        if (pn) return pn;
       }
       return undefined;
     } catch {
@@ -659,7 +670,8 @@ export class WhatsAppAdapter extends BaseAdapter {
   }
 
   /** Aggregate observations only; no message text, IDs, phone numbers or QR data. */
-  getMessageDiagnostics(): { mapped: number; lid: number; alternateIdentity: number; self: number; unsupported: number; nonNotify: number } {
+  getMessageDiagnostics(): { mapped: number; lid: number; alternateIdentity: number; self: number; unsupported: number; nonNotify: number;
+    groupMetadata: number; groupCreator: number; groupBotIdentity: number; groupMembers: number } {
     return { ...this.messageDiagnostics };
   }
 
