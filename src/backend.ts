@@ -13,6 +13,7 @@ export interface BackendMessage {
   addressed?: boolean;
   groupCreator?: string;
   groupParticipants?: string[];
+  groupMembersResolved?: boolean;
 }
 export interface Backend {
   authorize(message: BackendMessage): boolean | Promise<boolean>;
@@ -88,7 +89,8 @@ export function createBackendHost(options: BackendHostOptions) {
       message = { platform: raw.platform, userId: raw.userId, channelId: raw.channelId,
         messageId: raw.id, text: raw.content, chatType: "group", stableMessageId: true,
         addressed: raw.metadata.addressed as boolean, groupCreator: raw.metadata.groupCreator as string,
-        groupParticipants: raw.metadata.groupParticipants as string[] };
+        groupParticipants: raw.metadata.groupParticipants as string[],
+        groupMembersResolved: raw.metadata.groupMembersResolved !== false };
     }
     try { if (allow(message) !== true) return; } catch { report("backend"); return; }
     if (pending >= capacity) { report("overload"); return; }

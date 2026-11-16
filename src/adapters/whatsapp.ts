@@ -46,6 +46,8 @@ export interface WhatsAppGroupContext {
   participants: WhatsAppGroupParticipant[];
   /** The bot's own PN/LID identities, used to detect mentions. */
   botJids: string[];
+  /** False when a member's phone number could not be resolved: the group must then not be answered. */
+  membersResolved?: boolean;
 }
 
 // Baileys cleanMessage() normalizes absent participants to the empty string.
@@ -109,7 +111,8 @@ export function mapStrictWhatsAppGroupMessage(msg: any, context?: WhatsAppGroupC
   return { id: key.id, platform: "whatsapp", channelId: key.remoteJid, userId: resolved.pn, content,
     timestamp: msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now(),
     metadata: { chatType: "group", stableMessageId: true, addressed,
-      groupCreator: context.creatorJid, groupParticipants: context.participants.map((p) => p.pn) } };
+      groupCreator: context.creatorJid, groupParticipants: context.participants.map((p) => p.pn),
+      groupMembersResolved: context.membersResolved !== false } };
 }
 
 interface WhatsAppContact {
@@ -309,17 +312,54 @@ export class WhatsAppAdapter extends BaseAdapter {
       if (!metadata || metadata.id !== groupJid) return undefined;
       const creator = isPnJid(metadata.ownerPn) ? metadata.ownerPn : isPnJid(metadata.owner) ? metadata.owner : undefined;
       if (!creator || !Array.isArray(metadata.participants)) return undefined;
-      const botJids = [this.sock.user?.id, this.sock.user?.lid].filter((jid: unknown): jid is string => isPnJid(jid) || isLidJid(jid));
+      const botJids = [this.sock.user?.id, this.sock.user?.lid, this.sock.user?.phoneNumber]
+        .filter((jid: unknown): jid is string => isPnJid(jid) || isLidJid(jid));
       const participants: WhatsAppGroupParticipant[] = [];
+      const unresolved: string[] = [];
       for (const participant of metadata.participants) {
         if (!participant || typeof participant.id !== "string") continue;
         const pn = isPnJid(participant.phoneNumber) ? participant.phoneNumber : isPnJid(participant.id) ? participant.id : undefined;
-        if (!pn) continue;
+        // The bot's own account is a group member but never a participant to answer.
         if (botJids.includes(participant.id) || botJids.includes(participant.lid ?? "") || botJids.includes(pn)) continue;
+        if (!pn) {
+          if (isLidJid(participant.id)) unresolved.push(participant.id);
+          continue;
+        }
         participants.push({ id: participant.id, pn });
       }
+      // A LID-only member cannot be compared with a phone-number allow list until it is resolved.
+      for (const lid of unresolved) {
+        const pn = await this.resolveLidPhoneNumber(lid);
+        if (pn) participants.push({ id: lid, pn });
+      }
       if (!participants.length) return undefined;
-      return { creatorJid: creator, participants, botJids };
+      return { creatorJid: creator, participants, botJids, membersResolved: unresolved.length === 0 };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Resolve one LID to its phone-number JID: the socket's server-established mapping first, then a fresh query. */
+  private async resolveLidPhoneNumber(lid: string): Promise<string | undefined> {
+    if (!isLidJid(lid)) return undefined;
+    try {
+      const mapped = await this.sock?.signalRepository?.lidMapping?.getPNForLID?.(lid);
+      if (isPnJid(mapped)) return mapped;
+    } catch { /* fall through to a fresh query */ }
+    if (!this.sock?.executeUSyncQuery) return undefined;
+    try {
+      const baileys = await this.loadBaileys();
+      const result = await this.sock.executeUSyncQuery(
+        new baileys.USyncQuery().withLIDProtocol().withContext("background")
+          .withUser(new baileys.USyncUser().withLid(lid)),
+      );
+      const rows = Array.isArray(result?.list) ? result.list : [];
+      for (const row of rows) {
+        if (isPnJid(row?.id)) return row.id;
+        if (isPnJid(row?.lid)) return row.lid;
+        if (isPnJid(row?.phone)) return row.phone;
+      }
+      return undefined;
     } catch {
       return undefined;
     }
