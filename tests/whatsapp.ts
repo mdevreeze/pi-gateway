@@ -11,6 +11,7 @@ const { WhatsAppAdapter, mapStrictWhatsAppMessage } = await import("../src/adapt
 const { createBackendHost } = await import("../src/backend.js");
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 const jid = "123@s.whatsapp.net";
+const group = "1234567890-1234567890@g.us";
 const raw = (id: string, text = "hello") => ({ key: { id, remoteJid: jid, fromMe: false }, message: { conversation: text } });
 const config = { enabled: true, platform: "whatsapp" as const, strictBackendMessages: true, startupTimeoutMs: 1000, maxMessageLength: 50 };
 function fake() {
@@ -30,7 +31,16 @@ function fake() {
     withContext(context: string) { this.context = context; return this; }
     withUser(user: USyncUser) { this.users.push(user); return this; }
   }
-  const sock = { ev, executeUSyncQuery: async (q: any) => { queries.push(q); return query(); }, end: () => { ends++; if (failEnd) throw Error("private end"); }, logout: async () => { logouts++; },
+  const groupMetadata = async (id: string) => id === group ? {
+    id: group, owner: "111@lid", ownerPn: jid,
+    participants: [
+      { id: jid, phoneNumber: jid },
+      { id: "222@lid", phoneNumber: "222@s.whatsapp.net" },
+      { id: "999@lid", phoneNumber: "999@s.whatsapp.net" },
+    ],
+  } : undefined;
+  const sock = { ev, user: { id: "999@lid", lid: "999@lid" }, groupMetadata,
+    executeUSyncQuery: async (q: any) => { queries.push(q); return query(); }, end: () => { ends++; if (failEnd) throw Error("private end"); }, logout: async () => { logouts++; },
     sendMessage: async (channel: string, payload: any) => { if (failSend) throw Error("private send"); sent.push({ channel, payload }); return { key: { id: "sent" } }; } };
   const dependencies = { loadBaileys: async () => ({ USyncQuery, USyncUser, useMultiFileAuthState: async () => ({ state: {}, saveCreds: () => save() }),
     makeWASocket: (options: any) => { opts = options; return sock; } }) };
@@ -53,9 +63,21 @@ try {
   assert.equal(adapter.getQrCode(), "private-qr-secret");
   f.ev.emit("messages.upsert", { type: "append", messages: [raw("history")] });
   f.ev.emit("messages.upsert", { type: "notify", messages: [raw("original"), { ...raw("bad"), key: { ...raw("bad").key, remoteJid: "123@g.us" } }] });
+  await tick(); await tick();
   assert.deepEqual(incoming.map(m => m.id), ["before-start", "original"]);
   assert.deepEqual(incoming[0].metadata, { chatType: "direct", stableMessageId: true });
+  const groupRaw = { key: { id: "group-1", remoteJid: group, participant: "222@lid", fromMe: false },
+    message: { extendedTextMessage: { text: "hello bot", contextInfo: { mentionedJid: ["999@lid"] } } } };
   f.ev.emit("connection.update", { connection: "open" }); await starting;
+  f.ev.emit("messages.upsert", { type: "notify", messages: [groupRaw] });
+  await tick(); await tick();
+  assert.equal(incoming.at(-1)?.id, "group-1");
+  assert.equal(incoming.at(-1)?.channelId, group);
+  assert.equal(incoming.at(-1)?.userId, "222@s.whatsapp.net");
+  assert.equal(incoming.at(-1)?.metadata.chatType, "group");
+  assert.equal(incoming.at(-1)?.metadata.addressed, true);
+  assert.equal(incoming.at(-1)?.metadata.groupCreator, jid);
+  assert.deepEqual(incoming.at(-1)?.metadata.groupParticipants, [jid, "222@s.whatsapp.net"]);
   assert.equal(adapter.getQrCode(), null);
   await adapter.sendMessage(jid, "ok"); assert.equal(f.sent[0].payload.text, "ok");
   await assert.rejects(adapter.sendMessage(jid, "x".repeat(51)), /exceeds/);
@@ -155,6 +177,7 @@ try {
     { ...raw("private-self"), key: { ...raw("private-self").key, fromMe: true } },
     { ...raw("private-invalid"), message: {} },
   ] });
+  await tick(); await tick();
   const snapshot = observedAdapter.getMessageDiagnostics();
   assert.deepEqual(snapshot, { mapped: 1, lid: 1, alternateIdentity: 1, self: 1, unsupported: 1, nonNotify: 1 });
   snapshot.mapped = 999;
@@ -177,6 +200,7 @@ try {
   cleanMessage(cleanedLid, "555@s.whatsapp.net", "555@lid");
   assert.equal(cleanedLid.key.participant, "");
   boundSource.ev.emit("messages.upsert", { type: "notify", messages: [cleanedLid] });
+  await tick(); await tick();
   assert.equal(boundIncoming.length, 1);
   assert.equal(boundIncoming[0].id, "lid-original");
   assert.equal(boundIncoming[0].channelId, jid); assert.equal(boundIncoming[0].userId, jid);
@@ -232,6 +256,7 @@ try {
   legacy.ev.emit("connection.update", { connection: "open" });
   await legacyAdapter.start({ onMessage: async m => { oldIncoming.push(m); } });
   legacy.ev.emit("messages.upsert", { type: "append", messages: [raw("legacy")] });
+  await tick();
   assert.equal(oldIncoming[0].id, "legacy");
   await legacyAdapter.sendMessage(jid, "abcdefgh"); assert.equal(legacy.sent[0].payload.text, "ab...");
   await legacyAdapter.stop(); assert.equal(legacy.logouts, 1); assert.equal(legacy.ends, 0);

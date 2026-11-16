@@ -1,11 +1,33 @@
 import assert from "node:assert/strict";
 import { BaseAdapter, type PlatformMessage } from "../src/adapters/base.js";
-import { mapStrictWhatsAppMessage } from "../src/adapters/whatsapp.js";
+import { mapStrictWhatsAppMessage, mapStrictWhatsAppGroupMessage } from "../src/adapters/whatsapp.js";
 import { createBackendHost, type BackendError } from "../src/backend.js";
 
 const jid = "123@s.whatsapp.net";
 const raw = (id = "id", content = "hello") => ({ key: { id, remoteJid: jid, fromMe: false }, message: { conversation: content } });
 assert.equal(mapStrictWhatsAppMessage(raw())?.id, "id");
+const group = "1234567890-1234567890@g.us";
+const groupContext = {
+  creatorJid: jid,
+  participants: [
+    { id: jid, pn: jid },
+    { id: "456@lid", pn: "456@s.whatsapp.net" },
+  ],
+  botJids: ["999@s.whatsapp.net", "888@lid"],
+};
+const groupRaw = (id = "group", content = "hello") => ({
+  key: { id, remoteJid: group, participant: "456@lid", fromMe: false },
+  message: { extendedTextMessage: { text: content, contextInfo: { mentionedJid: ["999@s.whatsapp.net"] } } },
+});
+const mappedGroup = mapStrictWhatsAppGroupMessage(groupRaw(), groupContext);
+assert.equal(mappedGroup?.userId, "456@s.whatsapp.net");
+assert.equal(mappedGroup?.channelId, group);
+assert.equal(mappedGroup?.metadata?.chatType, "group");
+assert.equal(mappedGroup?.metadata?.addressed, true);
+assert.equal(mapStrictWhatsAppGroupMessage(groupRaw()), undefined);
+assert.equal(mapStrictWhatsAppGroupMessage(groupRaw("bad"), { ...groupContext, creatorJid: "" }), undefined);
+assert.equal(mapStrictWhatsAppGroupMessage(groupRaw("bad"), { ...groupContext, participants: [] }), undefined);
+assert.equal(mapStrictWhatsAppGroupMessage({ ...groupRaw(), key: { ...groupRaw().key, participant: "777@lid" } }, groupContext), undefined);
 for (const key of [
   { id: "", remoteJid: jid, fromMe: false }, { id: "1", remoteJid: jid, fromMe: true },
   { id: "1", remoteJid: "1@g.us", fromMe: false }, { id: "1", remoteJid: "1@lid", fromMe: false },
@@ -29,7 +51,7 @@ const errors: BackendError[] = [];
 let auth = 0, calls = 0;
 let release!: () => void;
 let block = false;
-const host = createBackendHost({ adapter, capacity: 2, allow: m => m.userId === jid,
+const host = createBackendHost({ adapter, capacity: 2, allow: m => [jid, "456@s.whatsapp.net"].includes(m.userId),
   backend: { authorize: m => { auth++; return m.messageId !== "deny"; }, submit: async m => {
     calls++; if (block) await new Promise<void>(resolve => { release = resolve; });
     if (m.text === "throw") throw Error("private"); return `answer ${m.text}`;
@@ -43,6 +65,9 @@ assert.equal(auth, 1); assert.equal(calls, 0); assert.deepEqual(adapter.sent, []
 await emit("ok", "/model evil"); await emit("ok", "Callback: model:evil"); await emit("ok", "/restart");
 assert.equal(calls, 0);
 await emit("ok", "hello"); assert.deepEqual(adapter.sent, [`${jid}:answer hello`]);
+const groupMapped = mapStrictWhatsAppGroupMessage(groupRaw("group-ok"), groupContext)!;
+await adapter.emit(groupMapped);
+assert.equal(calls, 2); assert.equal(adapter.sent.at(-1), `${group}:answer hello`);
 await emit("err", "throw"); assert.equal(errors.at(-1), "backend");
 adapter.fail = true; await emit("send", "hi"); assert.equal(errors.at(-1), "delivery"); adapter.fail = false;
 block = true;
@@ -56,9 +81,9 @@ const second = emit("b", "two");
 await emit("c", "three"); assert.equal(errors.at(-1), "overload");
 host.stopIngress();
 const closing = host.close(); assert.equal(host.close(), closing); release(); await Promise.all([first, second, closing]);
-assert.equal(calls, 4); // hello, throw, failed delivery, active one; queued two cancelled
+assert.equal(calls, 5); // hello, group hello, throw, failed delivery, active one; queued two cancelled
 assert.equal(errors.includes("shutdown"), true);
-assert.equal(adapter.sent.length, 1);
+assert.equal(adapter.sent.length, 2);
 await assert.rejects(host.start());
 // Identical IDs are deliberately not deduplicated by the host.
 const replayAdapter = new Fake(); let replayCalls = 0;

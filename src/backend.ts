@@ -8,8 +8,11 @@ export interface BackendMessage {
   channelId: string;
   messageId: string;
   text: string;
-  chatType: "direct";
+  chatType: "direct" | "group";
   stableMessageId: true;
+  addressed?: boolean;
+  groupCreator?: string;
+  groupParticipants?: string[];
 }
 export interface Backend {
   authorize(message: BackendMessage): boolean | Promise<boolean>;
@@ -67,13 +70,26 @@ export function createBackendHost(options: BackendHostOptions) {
   const dispatch = async (raw: PlatformMessage): Promise<void> => {
     if (state !== "running" && state !== "starting") { report("shutdown"); return; }
     // Metadata is a trusted adapter assertion, not remote-client authentication.
-    if (raw.platform !== "whatsapp" || raw.metadata?.chatType !== "direct" || raw.metadata?.stableMessageId !== true ||
+    if (raw.platform !== "whatsapp" || !["direct", "group"].includes(raw.metadata?.chatType as string) || raw.metadata?.stableMessageId !== true ||
         typeof raw.id !== "string" || !raw.id.trim() || raw.id.trim() !== raw.id || raw.id.length > 512 ||
         /[\u0000-\u001f\u007f]/.test(raw.id) || typeof raw.channelId !== "string" ||
-        !/^[0-9]+@s\.whatsapp\.net$/.test(raw.channelId) || raw.userId !== raw.channelId ||
         typeof raw.content !== "string" || !raw.content.trim() || raw.content.length > 65536) return;
-    const message: BackendMessage = { platform: raw.platform, userId: raw.userId, channelId: raw.channelId,
-      messageId: raw.id, text: raw.content, chatType: "direct", stableMessageId: true };
+    let message: BackendMessage;
+    if (raw.metadata.chatType === "direct") {
+      if (!/^[0-9]+@s\.whatsapp\.net$/.test(raw.channelId) || raw.userId !== raw.channelId) return;
+      message = { platform: raw.platform, userId: raw.userId, channelId: raw.channelId,
+        messageId: raw.id, text: raw.content, chatType: "direct", stableMessageId: true };
+    } else {
+      if (!/^[0-9-]+@g\.us$/.test(raw.channelId) || !/^[0-9]+@s\.whatsapp\.net$/.test(raw.userId) ||
+          !/^[0-9]+@s\.whatsapp\.net$/.test(raw.metadata.groupCreator as string) ||
+          !Array.isArray(raw.metadata.groupParticipants) || !raw.metadata.groupParticipants.length ||
+          !raw.metadata.groupParticipants.every((jid: unknown) => typeof jid === "string" && /^[0-9]+@s\.whatsapp\.net$/.test(jid)) ||
+          !(raw.metadata.groupParticipants as string[]).includes(raw.userId) || typeof raw.metadata.addressed !== "boolean") return;
+      message = { platform: raw.platform, userId: raw.userId, channelId: raw.channelId,
+        messageId: raw.id, text: raw.content, chatType: "group", stableMessageId: true,
+        addressed: raw.metadata.addressed as boolean, groupCreator: raw.metadata.groupCreator as string,
+        groupParticipants: raw.metadata.groupParticipants as string[] };
+    }
     try { if (allow(message) !== true) return; } catch { report("backend"); return; }
     if (pending >= capacity) { report("overload"); return; }
     pending++;
